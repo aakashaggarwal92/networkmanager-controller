@@ -64,7 +64,7 @@ def wait_for_attachment_tags(
     )
 
 
-@pytest.fixture(scope="class")
+@pytest.fixture
 def simple_vpc_attachment(networkmanager_client):
     resources = get_bootstrap_resources()
     resource_name = random_suffix_name("vpc-attachment-ack-test", 31)
@@ -97,6 +97,15 @@ def simple_vpc_attachment(networkmanager_client):
     assert cr is not None
     assert k8s.get_resource_exists(ref)
 
+    # Prow runs tests across multiple pytest-xdist workers. Keep all
+    # VpcAttachment lifecycle assertions in one test (below), and do not
+    # expose the fixture until AWS has returned the generated attachment ID.
+    # A status object alone only means the controller has consumed the CR; it
+    # does not guarantee CreateVpcAttachment has completed.
+    assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=10)
+    cr = k8s.get_resource(ref)
+    assert cr.get("status", {}).get("attachmentID")
+
     yield (ref, cr)
 
     attachment_id = cr.get("status", {}).get("attachmentID")
@@ -121,6 +130,15 @@ class TestVPCAttachment:
         {"tag_key": "initialtagkey", "tag_value": "initialtagvalue"}
     )
     def test_crud(self, networkmanager_client, simple_vpc_attachment):
+        """Exercises the complete VpcAttachment lifecycle sequentially.
+
+        Network Manager permits a VPC to have only one Core Network attachment.
+        Prow distributes individual test methods across pytest-xdist workers,
+        and class-scoped fixtures are not shared between worker processes.
+        Keeping create/read/options, tags, and subnet updates in one test avoids
+        concurrent attempts to attach the same bootstrapped VPC while retaining
+        coverage for every supported mutable field.
+        """
         (ref, cr) = simple_vpc_attachment
         resources = get_bootstrap_resources()
         networkmanager_validator = NetworkManagerValidator(networkmanager_client)
@@ -128,15 +146,7 @@ class TestVPCAttachment:
         # Attachment ID is populated by the syncTopLevelStatus hook; without
         # it, requiredFieldsMissingFromReadOneInput would stay true forever
         # and the controller would never progress past Create.
-        assert "attachmentID" in cr["status"]
         attachment_id = cr["status"]["attachmentID"]
-        assert attachment_id
-
-        # Depending on the test Core Network's policy, the attachment may
-        # need manual or automatic acceptance before it reaches AVAILABLE.
-        # Phase 1 does not grant AcceptAttachment, so this assumes the test
-        # fixture's policy auto-accepts VPC attachments.
-        assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=10)
 
         networkmanager_validator.assert_vpc_attachment(attachment_id)
         vpc_attachment = networkmanager_validator.get_vpc_attachment(attachment_id)
@@ -148,17 +158,6 @@ class TestVPCAttachment:
         assert vpc_attachment["Options"]["Ipv6Support"] is False
         assert vpc_attachment["Options"]["SecurityGroupReferencingSupport"] is True
 
-    @pytest.mark.resource_data(
-        {"tag_key": "initialtagkey", "tag_value": "initialtagvalue"}
-    )
-    def test_crud_tags(self, networkmanager_client, simple_vpc_attachment):
-        (ref, cr) = simple_vpc_attachment
-        networkmanager_validator = NetworkManagerValidator(networkmanager_client)
-        attachment_id = cr["status"]["attachmentID"]
-
-        assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=10)
-
-        vpc_attachment = networkmanager_validator.get_vpc_attachment(attachment_id)
         tags.assert_ack_system_tags(tags=vpc_attachment["Attachment"]["Tags"])
         tags.assert_equal_without_ack_tags(
             expected={"initialtagkey": "initialtagvalue"},
@@ -198,27 +197,9 @@ class TestVPCAttachment:
             actual=remaining_tags,
         )
 
-    @pytest.mark.slow
-    @pytest.mark.resource_data(
-        {"tag_key": "initialtagkey", "tag_value": "initialtagvalue"}
-    )
-    def test_subnet_delta_update(self, networkmanager_client, simple_vpc_attachment):
-        """Verifies that adding a second subnet produces an exact
-        AddSubnetArns delta (via UpdateVpcAttachment), not a full
-        replacement of the subnet list, and that the first subnet is not
-        detached in the process.
-
-        Marked slow because it performs an additional Cloud WAN update.
-        The bootstrap provisions the second subnet in a distinct Availability
-        Zone so UpdateVpcAttachment can add it to the attachment.
-        """
-        (ref, cr) = simple_vpc_attachment
-        resources = get_bootstrap_resources()
-
-        networkmanager_validator = NetworkManagerValidator(networkmanager_client)
-        attachment_id = cr["status"]["attachmentID"]
-        assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=10)
-
+        # UpdateVpcAttachment models subnet membership as exact additions and
+        # removals. Adding SubnetArn2 must preserve SubnetArn1 rather than
+        # treating the desired list as a blind replacement or re-addition.
         updates = {
             "spec": {"subnetARNs": [resources.SubnetArn1, resources.SubnetArn2]},
         }
